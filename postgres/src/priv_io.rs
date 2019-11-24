@@ -1,33 +1,33 @@
-use std::io::{self, BufWriter, Read, Write};
-use std::net::{ToSocketAddrs, SocketAddr};
-use std::time::Duration;
-use std::result;
 use bytes::{BufMut, BytesMut};
+use postgres_protocol::message::backend;
+use postgres_protocol::message::frontend;
+use socket2::{Domain, SockAddr, Socket, Type};
+use std::io::{self, BufWriter, Read, Write};
+use std::net::{SocketAddr, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd, FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, RawSocket};
-use postgres_protocol::message::frontend;
-use postgres_protocol::message::backend;
-use socket2::{Socket, SockAddr, Domain, Type};
+use std::result;
+use std::time::Duration;
 
-use {Result, TlsMode};
 use error;
-use tls::TlsStream;
 use params::{ConnectParams, Host};
+use tls::TlsStream;
+use {Result, TlsMode};
 
 const INITIAL_CAPACITY: usize = 8 * 1024;
 
 pub struct MessageStream {
-    stream: BufWriter<Box<TlsStream>>,
+    stream: BufWriter<Box<dyn TlsStream>>,
     in_buf: BytesMut,
     out_buf: Vec<u8>,
 }
 
 impl MessageStream {
-    pub fn new(stream: Box<TlsStream>) -> MessageStream {
+    pub fn new(stream: Box<dyn TlsStream>) -> MessageStream {
         MessageStream {
             stream: BufWriter::new(stream),
             in_buf: BytesMut::with_capacity(INITIAL_CAPACITY),
@@ -35,7 +35,7 @@ impl MessageStream {
         }
     }
 
-    pub fn get_ref(&self) -> &Box<TlsStream> {
+    pub fn get_ref(&self) -> &Box<dyn TlsStream> {
         self.stream.get_ref()
     }
 
@@ -61,9 +61,11 @@ impl MessageStream {
 
     fn read_in(&mut self) -> io::Result<()> {
         self.in_buf.reserve(1);
-        match self.stream.get_mut().read(
-            unsafe { self.in_buf.bytes_mut() },
-        ) {
+        match self
+            .stream
+            .get_mut()
+            .read(unsafe { self.in_buf.bytes_mut() })
+        {
             Ok(0) => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "unexpected EOF",
@@ -88,8 +90,11 @@ impl MessageStream {
             match r {
                 Ok(()) => {}
                 Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock ||
-                           e.kind() == io::ErrorKind::TimedOut => return Ok(None),
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    return Ok(None)
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -195,37 +200,31 @@ fn open_socket(params: &ConnectParams) -> Result<Socket> {
                 }
             }
 
-            Err(
-                error
-                    .unwrap_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "could not resolve any addresses",
-                        )
-                    })
-                    .into(),
-            )
+            Err(error
+                .unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "could not resolve any addresses",
+                    )
+                })
+                .into())
         }
         #[cfg(unix)]
         Host::Unix(ref path) => {
             let path = path.join(&format!(".s.PGSQL.{}", port));
-            Ok(UnixStream::connect(&path).map(|s| unsafe {
-                Socket::from_raw_fd(s.into_raw_fd())
-            })?)
+            Ok(UnixStream::connect(&path)
+                .map(|s| unsafe { Socket::from_raw_fd(s.into_raw_fd()) })?)
         }
         #[cfg(not(unix))]
-        Host::Unix(..) => {
-            Err(
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unix sockets are not supported on this system",
-                ).into(),
-            )
-        }
+        Host::Unix(..) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unix sockets are not supported on this system",
+        )
+        .into()),
     }
 }
 
-pub fn initialize_stream(params: &ConnectParams, tls: TlsMode) -> Result<Box<TlsStream>> {
+pub fn initialize_stream(params: &ConnectParams, tls: TlsMode) -> Result<Box<dyn TlsStream>> {
     let mut socket = Stream(open_socket(params)?);
 
     let (tls_required, handshaker) = match tls {

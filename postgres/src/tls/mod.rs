@@ -2,8 +2,8 @@
 pub use priv_io::Stream;
 
 use std::error::Error;
-use std::io::prelude::*;
 use std::fmt;
+use std::io::prelude::*;
 
 #[cfg(feature = "with-native-tls")]
 pub mod native_tls;
@@ -35,7 +35,7 @@ pub trait TlsHandshake: fmt::Debug {
         &self,
         host: &str,
         stream: Stream,
-    ) -> Result<Box<TlsStream>, Box<Error + Sync + Send>>;
+    ) -> Result<Box<dyn TlsStream>, Box<dyn Error + Sync + Send>>;
 }
 
 impl<T: TlsHandshake + ?Sized> TlsHandshake for Box<T> {
@@ -43,7 +43,7 @@ impl<T: TlsHandshake + ?Sized> TlsHandshake for Box<T> {
         &self,
         host: &str,
         stream: Stream,
-    ) -> Result<Box<TlsStream>, Box<Error + Sync + Send>> {
+    ) -> Result<Box<dyn TlsStream>, Box<dyn Error + Sync + Send>> {
         (**self).tls_handshake(host, stream)
     }
 }

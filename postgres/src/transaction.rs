@@ -1,14 +1,14 @@
 //! Transactions
 
-use std::cell::Cell;
-use std::fmt;
+use rows::Rows;
 #[allow(unused_imports)]
 use std::ascii::AsciiExt;
-
-use {bad_response, Connection, Result};
-use rows::Rows;
+use std::borrow::Borrow;
+use std::cell::Cell;
+use std::fmt;
 use stmt::Statement;
 use types::ToSql;
+use {bad_response, Connection, Result};
 
 /// An enumeration of transaction isolation levels.
 ///
@@ -143,15 +143,21 @@ impl Config {
 /// A transaction on a database connection.
 ///
 /// The transaction will roll back by default.
-pub struct Transaction<'conn> {
-    conn: &'conn Connection,
+pub struct Transaction<C>
+where
+    C: Borrow<Connection>,
+{
+    conn: C,
     depth: u32,
     savepoint_name: Option<String>,
     commit: Cell<bool>,
     finished: bool,
 }
 
-impl<'a> fmt::Debug for Transaction<'a> {
+impl<C> fmt::Debug for Transaction<C>
+where
+    C: Borrow<Connection>,
+{
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("Transaction")
             .field("commit", &self.commit.get())
@@ -160,7 +166,10 @@ impl<'a> fmt::Debug for Transaction<'a> {
     }
 }
 
-impl<'conn> Drop for Transaction<'conn> {
+impl<C> Drop for Transaction<C>
+where
+    C: Borrow<Connection>,
+{
     fn drop(&mut self) {
         if !self.finished {
             let _ = self.finish_inner();
@@ -168,8 +177,11 @@ impl<'conn> Drop for Transaction<'conn> {
     }
 }
 
-impl<'conn> Transaction<'conn> {
-    pub(crate) fn new(conn: &'conn Connection, depth: u32) -> Transaction<'conn> {
+impl<C> Transaction<C>
+where
+    C: Borrow<Connection>,
+{
+    pub(crate) fn new(conn: C, depth: u32) -> Transaction<C> {
         Transaction {
             conn: conn,
             depth: depth,
@@ -179,8 +191,8 @@ impl<'conn> Transaction<'conn> {
         }
     }
 
-    pub(crate) fn conn(&self) -> &'conn Connection {
-        self.conn
+    pub(crate) fn conn(&self) -> &Connection {
+        self.conn.borrow()
     }
 
     pub(crate) fn depth(&self) -> u32 {
@@ -188,7 +200,7 @@ impl<'conn> Transaction<'conn> {
     }
 
     fn finish_inner(&mut self) -> Result<()> {
-        let mut conn = self.conn.0.borrow_mut();
+        let mut conn = self.conn().0.borrow_mut();
         debug_assert!(self.depth == conn.trans_depth);
         conn.trans_depth -= 1;
         match (self.commit.get(), &self.savepoint_name) {
@@ -202,8 +214,8 @@ impl<'conn> Transaction<'conn> {
     }
 
     /// Like `Connection::prepare`.
-    pub fn prepare(&self, query: &str) -> Result<Statement<'conn>> {
-        self.conn.prepare(query)
+    pub fn prepare<'a>(&'a self, query: &str) -> Result<Statement<'a>> {
+        self.conn().prepare(query)
     }
 
     /// Like `Connection::prepare_cached`.
@@ -212,23 +224,23 @@ impl<'conn> Transaction<'conn> {
     ///
     /// The statement will be cached for the duration of the
     /// connection, not just the duration of this transaction.
-    pub fn prepare_cached(&self, query: &str) -> Result<Statement<'conn>> {
-        self.conn.prepare_cached(query)
+    pub fn prepare_cached<'a>(&'a self, query: &str) -> Result<Statement<'a>> {
+        self.conn().prepare_cached(query)
     }
 
     /// Like `Connection::execute`.
-    pub fn execute(&self, query: &str, params: &[&ToSql]) -> Result<u64> {
-        self.conn.execute(query, params)
+    pub fn execute(&self, query: &str, params: &[&dyn ToSql]) -> Result<u64> {
+        self.conn().execute(query, params)
     }
 
     /// Like `Connection::query`.
-    pub fn query<'a>(&'a self, query: &str, params: &[&ToSql]) -> Result<Rows> {
-        self.conn.query(query, params)
+    pub fn query<'a>(&'a self, query: &str, params: &[&dyn ToSql]) -> Result<Rows> {
+        self.conn().query(query, params)
     }
 
     /// Like `Connection::batch_execute`.
     pub fn batch_execute(&self, query: &str) -> Result<()> {
-        self.conn.batch_execute(query)
+        self.conn().batch_execute(query)
     }
 
     /// Like `Connection::transaction`, but creates a nested transaction via
@@ -237,7 +249,7 @@ impl<'conn> Transaction<'conn> {
     /// # Panics
     ///
     /// Panics if there is an active nested transaction.
-    pub fn transaction<'a>(&'a self) -> Result<Transaction<'a>> {
+    pub fn transaction(&self) -> Result<Transaction<&Connection>> {
         self.savepoint("sp")
     }
 
@@ -247,8 +259,8 @@ impl<'conn> Transaction<'conn> {
     /// # Panics
     ///
     /// Panics if there is an active nested transaction.
-    pub fn savepoint<'a>(&'a self, name: &str) -> Result<Transaction<'a>> {
-        let mut conn = self.conn.0.borrow_mut();
+    pub fn savepoint(&self, name: &str) -> Result<Transaction<&Connection>> {
+        let mut conn = self.conn().0.borrow_mut();
         check_desync!(conn);
         assert!(
             conn.trans_depth == self.depth,
@@ -256,8 +268,9 @@ impl<'conn> Transaction<'conn> {
         );
         conn.quick_query(&format!("SAVEPOINT {}", name))?;
         conn.trans_depth += 1;
+
         Ok(Transaction {
-            conn: self.conn,
+            conn: self.conn(),
             depth: self.depth + 1,
             savepoint_name: Some(name.to_owned()),
             commit: Cell::new(false),
@@ -266,13 +279,13 @@ impl<'conn> Transaction<'conn> {
     }
 
     /// Returns a reference to the `Transaction`'s `Connection`.
-    pub fn connection(&self) -> &'conn Connection {
-        self.conn
+    pub fn connection(&self) -> &Connection {
+        self.conn()
     }
 
     /// Like `Connection::is_active`.
     pub fn is_active(&self) -> bool {
-        self.conn.0.borrow().trans_depth == self.depth
+        self.conn().0.borrow().trans_depth == self.depth
     }
 
     /// Alters the configuration of the active transaction.

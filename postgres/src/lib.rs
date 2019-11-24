@@ -80,6 +80,12 @@ extern crate postgres_shared;
 extern crate socket2;
 
 use fallible_iterator::FallibleIterator;
+use postgres_protocol::authentication;
+use postgres_protocol::authentication::sasl::{self, ScramSha256};
+use postgres_protocol::message::backend::{self, ErrorFields};
+use postgres_protocol::message::frontend;
+use postgres_shared::rows::RowData;
+use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -88,39 +94,34 @@ use std::mem;
 use std::result;
 use std::sync::Arc;
 use std::time::Duration;
-use postgres_protocol::authentication;
-use postgres_protocol::authentication::sasl::{self, ScramSha256};
-use postgres_protocol::message::backend::{self, ErrorFields};
-use postgres_protocol::message::frontend;
-use postgres_shared::rows::RowData;
 
 use error::{DbError, UNDEFINED_COLUMN, UNDEFINED_TABLE};
-use tls::TlsHandshake;
 use notification::{Notification, Notifications};
 use params::{IntoConnectParams, User};
 use priv_io::MessageStream;
 use rows::Rows;
 use stmt::{Column, Statement};
+use tls::TlsHandshake;
 use transaction::{IsolationLevel, Transaction};
 use types::{Field, FromSql, IsNull, Kind, Oid, ToSql, Type, CHAR, NAME, OID};
 
 #[doc(inline)]
+pub use error::Error;
+#[doc(inline)]
 pub use postgres_shared::CancelData;
 #[doc(inline)]
 pub use postgres_shared::{error, types};
-#[doc(inline)]
-pub use error::Error;
 
 #[macro_use]
 mod macros;
 
 mod feature_check;
-mod priv_io;
-pub mod tls;
 pub mod notification;
 pub mod params;
+mod priv_io;
 pub mod rows;
 pub mod stmt;
+pub mod tls;
 pub mod transaction;
 
 const TYPEINFO_QUERY: &'static str = "__typeinfo";
@@ -216,9 +217,9 @@ pub enum TlsMode<'a> {
     /// The connection will not use TLS.
     None,
     /// The connection will use TLS if the backend supports it.
-    Prefer(&'a TlsHandshake),
+    Prefer(&'a dyn TlsHandshake),
     /// The connection must use TLS.
-    Require(&'a TlsHandshake),
+    Require(&'a dyn TlsHandshake),
 }
 
 #[derive(Debug)]
@@ -230,7 +231,7 @@ struct StatementInfo {
 
 struct InnerConnection {
     stream: MessageStream,
-    notice_handler: Box<HandleNotice>,
+    notice_handler: Box<dyn HandleNotice>,
     notifications: VecDeque<Notification>,
     cancel_data: CancelData,
     unknown_types: HashMap<Oid, Type>,
@@ -422,9 +423,11 @@ impl InnerConnection {
             }
             backend::Message::AuthenticationSasl(body) => {
                 // count to validate the entire message body.
-                if body.mechanisms()
+                if body
+                    .mechanisms()
                     .filter(|m| *m == sasl::SCRAM_SHA_256)
-                    .count()? == 0
+                    .count()?
+                    == 0
                 {
                     return Err(
                         io::Error::new(io::ErrorKind::Other, "unsupported authentication").into(),
@@ -481,7 +484,7 @@ impl InnerConnection {
         }
     }
 
-    fn set_notice_handler(&mut self, handler: Box<HandleNotice>) -> Box<HandleNotice> {
+    fn set_notice_handler(&mut self, handler: Box<dyn HandleNotice>) -> Box<dyn HandleNotice> {
         mem::replace(&mut self.notice_handler, handler)
     }
 
@@ -525,7 +528,8 @@ impl InnerConnection {
             .collect()?;
 
         let columns = match raw_columns {
-            Some(body) => body.fields()
+            Some(body) => body
+                .fields()
                 .and_then(|field| {
                     Ok(Column::new(
                         field.name().to_owned(),
@@ -573,13 +577,12 @@ impl InnerConnection {
                             break;
                         }
                     }
-                    return Err(
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "COPY queries cannot be directly \
-                             executed",
-                        ).into(),
-                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "COPY queries cannot be directly \
+                         executed",
+                    )
+                    .into());
                 }
                 _ => {
                     self.desynchronized = true;
@@ -597,7 +600,7 @@ impl InnerConnection {
         portal_name: &str,
         row_limit: i32,
         param_types: &[Type],
-        params: &[&ToSql],
+        params: &[&dyn ToSql],
     ) -> Result<()> {
         assert!(
             param_types.len() == params.len(),
@@ -607,8 +610,7 @@ impl InnerConnection {
         );
         debug!(
             "executing statement {} with parameters: {:?}",
-            stmt_name,
-            params
+            stmt_name, params
         );
 
         {
@@ -838,8 +840,7 @@ impl InnerConnection {
 
         let mut variants = vec![];
         for row in rows {
-            variants.push(String::from_sql_nullable(&NAME, row.get(0))
-                .map_err(error::conversion)?);
+            variants.push(String::from_sql_nullable(&NAME, row.get(0)).map_err(error::conversion)?);
         }
 
         Ok(variants)
@@ -873,7 +874,8 @@ impl InnerConnection {
         let mut fields = vec![];
         for row in rows {
             let (name, type_) = {
-                let name = String::from_sql_nullable(&NAME, row.get(0)).map_err(error::conversion)?;
+                let name =
+                    String::from_sql_nullable(&NAME, row.get(0)).map_err(error::conversion)?;
                 let type_ = Oid::from_sql_nullable(&OID, row.get(1)).map_err(error::conversion)?;
                 (name, type_)
             };
@@ -908,10 +910,9 @@ impl InnerConnection {
             match self.read_message()? {
                 backend::Message::ReadyForQuery(_) => break,
                 backend::Message::DataRow(body) => {
-                    let row = body.ranges()
-                        .map(|r| {
-                            r.map(|r| String::from_utf8_lossy(&body.buffer()[r]).into_owned())
-                        })
+                    let row = body
+                        .ranges()
+                        .map(|r| r.map(|r| String::from_utf8_lossy(&body.buffer()[r]).into_owned()))
                         .collect()?;
                     result.push(row);
                 }
@@ -1054,7 +1055,7 @@ impl Connection {
     ///                        .unwrap();
     /// println!("{} rows updated", rows_updated);
     /// ```
-    pub fn execute(&self, query: &str, params: &[&ToSql]) -> Result<u64> {
+    pub fn execute(&self, query: &str, params: &[&dyn ToSql]) -> Result<u64> {
         let (param_types, columns) = self.0.borrow_mut().raw_prepare("", query)?;
         let info = Arc::new(StatementInfo {
             name: String::new(),
@@ -1090,7 +1091,7 @@ impl Connection {
     ///     println!("foo: {}", foo);
     /// }
     /// ```
-    pub fn query(&self, query: &str, params: &[&ToSql]) -> Result<Rows> {
+    pub fn query(&self, query: &str, params: &[&dyn ToSql]) -> Result<Rows> {
         let (param_types, columns) = self.0.borrow_mut().raw_prepare("", query)?;
         let info = Arc::new(StatementInfo {
             name: String::new(),
@@ -1126,23 +1127,55 @@ impl Connection {
     ///
     /// trans.commit().unwrap();
     /// ```
-    pub fn transaction<'a>(&'a self) -> Result<Transaction<'a>> {
+    pub fn transaction<'a>(&'a self) -> Result<Transaction<&'a Connection>> {
         self.transaction_with(&transaction::Config::new())
     }
 
+    /// Begins a new transaction.
+    ///
+    /// This variation of transaction() allows the transaction
+    /// to use an Rc or other borrowable reference type to refer to
+    /// the connection.
+    pub fn transaction_borrow<C>(conn: C) -> Result<Transaction<C>>
+    where
+        C: Borrow<Connection>,
+    {
+        Connection::transaction_with_borrow(conn, &transaction::Config::new())
+    }
+
     /// Begins a new transaction with the specified configuration.
-    pub fn transaction_with<'a>(&'a self, config: &transaction::Config) -> Result<Transaction<'a>> {
-        let mut conn = self.0.borrow_mut();
-        check_desync!(conn);
-        assert!(
-            conn.trans_depth == 0,
-            "`transaction` must be called on the active transaction"
-        );
-        let mut query = "BEGIN".to_owned();
-        config.build_command(&mut query);
-        conn.quick_query(&query)?;
-        conn.trans_depth += 1;
-        Ok(Transaction::new(self, 1))
+    pub fn transaction_with<'a>(
+        &'a self,
+        config: &transaction::Config,
+    ) -> Result<Transaction<&'a Connection>> {
+        Connection::transaction_with_borrow(self, config)
+    }
+
+    /// Begins a new transaction with the specified configuration.
+    ///
+    /// This variation of transaction_with() allows the transaction
+    /// to use an Rc or other borrowable reference type to refer to
+    /// the connection.
+    pub fn transaction_with_borrow<C>(
+        self_borrow: C,
+        config: &transaction::Config,
+    ) -> Result<Transaction<C>>
+    where
+        C: Borrow<Connection>,
+    {
+        {
+            let mut conn = self_borrow.borrow().0.borrow_mut();
+            check_desync!(conn);
+            assert!(
+                conn.trans_depth == 0,
+                "`transaction` must be called on the active transaction"
+            );
+            let mut query = "BEGIN".to_owned();
+            config.build_command(&mut query);
+            conn.quick_query(&query)?;
+            conn.trans_depth += 1;
+        }
+        Ok(Transaction::new(self_borrow, 1))
     }
 
     /// Creates a new prepared statement.
@@ -1271,7 +1304,7 @@ impl Connection {
     }
 
     /// Sets the notice handler for the connection, returning the old handler.
-    pub fn set_notice_handler(&self, handler: Box<HandleNotice>) -> Box<HandleNotice> {
+    pub fn set_notice_handler(&self, handler: Box<dyn HandleNotice>) -> Box<dyn HandleNotice> {
         self.0.borrow_mut().set_notice_handler(handler)
     }
 
@@ -1307,10 +1340,10 @@ impl Connection {
 /// A trait allowing abstraction over connections and transactions
 pub trait GenericConnection {
     /// Like `Connection::execute`.
-    fn execute(&self, query: &str, params: &[&ToSql]) -> Result<u64>;
+    fn execute(&self, query: &str, params: &[&dyn ToSql]) -> Result<u64>;
 
     /// Like `Connection::query`.
-    fn query<'a>(&'a self, query: &str, params: &[&ToSql]) -> Result<Rows>;
+    fn query<'a>(&'a self, query: &str, params: &[&dyn ToSql]) -> Result<Rows>;
 
     /// Like `Connection::prepare`.
     fn prepare<'a>(&'a self, query: &str) -> Result<Statement<'a>>;
@@ -1319,7 +1352,7 @@ pub trait GenericConnection {
     fn prepare_cached<'a>(&'a self, query: &str) -> Result<Statement<'a>>;
 
     /// Like `Connection::transaction`.
-    fn transaction<'a>(&'a self) -> Result<Transaction<'a>>;
+    fn transaction<'a>(&'a self) -> Result<Transaction<&'a Connection>>;
 
     /// Like `Connection::batch_execute`.
     fn batch_execute(&self, query: &str) -> Result<()>;
@@ -1329,11 +1362,11 @@ pub trait GenericConnection {
 }
 
 impl GenericConnection for Connection {
-    fn execute(&self, query: &str, params: &[&ToSql]) -> Result<u64> {
+    fn execute(&self, query: &str, params: &[&dyn ToSql]) -> Result<u64> {
         self.execute(query, params)
     }
 
-    fn query<'a>(&'a self, query: &str, params: &[&ToSql]) -> Result<Rows> {
+    fn query<'a>(&'a self, query: &str, params: &[&dyn ToSql]) -> Result<Rows> {
         self.query(query, params)
     }
 
@@ -1345,7 +1378,7 @@ impl GenericConnection for Connection {
         self.prepare_cached(query)
     }
 
-    fn transaction<'a>(&'a self) -> Result<Transaction<'a>> {
+    fn transaction<'a>(&'a self) -> Result<Transaction<&'a Connection>> {
         self.transaction()
     }
 
@@ -1358,12 +1391,15 @@ impl GenericConnection for Connection {
     }
 }
 
-impl<'a> GenericConnection for Transaction<'a> {
-    fn execute(&self, query: &str, params: &[&ToSql]) -> Result<u64> {
+impl<C> GenericConnection for Transaction<C>
+where
+    C: Borrow<Connection>,
+{
+    fn execute(&self, query: &str, params: &[&dyn ToSql]) -> Result<u64> {
         self.execute(query, params)
     }
 
-    fn query<'b>(&'b self, query: &str, params: &[&ToSql]) -> Result<Rows> {
+    fn query<'b>(&'b self, query: &str, params: &[&dyn ToSql]) -> Result<Rows> {
         self.query(query, params)
     }
 
@@ -1375,7 +1411,7 @@ impl<'a> GenericConnection for Transaction<'a> {
         self.prepare_cached(query)
     }
 
-    fn transaction<'b>(&'b self) -> Result<Transaction<'b>> {
+    fn transaction<'b>(&'b self) -> Result<Transaction<&'b Connection>> {
         self.transaction()
     }
 

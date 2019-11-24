@@ -1,5 +1,6 @@
 //! Query result rows.
 
+use crate::Connection;
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::frontend;
 use postgres_shared::rows::RowData;
@@ -13,11 +14,11 @@ use std::sync::Arc;
 #[doc(inline)]
 pub use postgres_shared::rows::RowIndex;
 
-use {Error, Result, StatementInfo};
 use error;
+use stmt::{Column, Statement};
 use transaction::Transaction;
 use types::{FromSql, WrongType};
-use stmt::{Statement, Column};
+use {Error, Result, StatementInfo};
 
 enum MaybeOwned<'a, T: 'a> {
     Borrowed(&'a T),
@@ -113,11 +114,9 @@ impl<'a> Iterator for Iter<'a> {
     type Item = Row<'a>;
 
     fn next(&mut self) -> Option<Row<'a>> {
-        self.iter.next().map(|row| {
-            Row {
-                stmt_info: self.stmt_info,
-                data: MaybeOwned::Borrowed(row),
-            }
+        self.iter.next().map(|row| Row {
+            stmt_info: self.stmt_info,
+            data: MaybeOwned::Borrowed(row),
         })
     }
 
@@ -128,11 +127,9 @@ impl<'a> Iterator for Iter<'a> {
 
 impl<'a> DoubleEndedIterator for Iter<'a> {
     fn next_back(&mut self) -> Option<Row<'a>> {
-        self.iter.next_back().map(|row| {
-            Row {
-                stmt_info: self.stmt_info,
-                data: MaybeOwned::Borrowed(row),
-            }
+        self.iter.next_back().map(|row| Row {
+            stmt_info: self.stmt_info,
+            data: MaybeOwned::Borrowed(row),
         })
     }
 }
@@ -261,7 +258,7 @@ pub struct LazyRows<'trans, 'stmt> {
     row_limit: i32,
     more_rows: bool,
     finished: bool,
-    _trans: &'trans Transaction<'trans>,
+    _trans: &'trans Transaction<&'trans Connection>,
 }
 
 impl<'a, 'b> Drop for LazyRows<'a, 'b> {
@@ -291,7 +288,7 @@ impl<'trans, 'stmt> LazyRows<'trans, 'stmt> {
         row_limit: i32,
         more_rows: bool,
         finished: bool,
-        trans: &'trans Transaction<'trans>,
+        trans: &'trans Transaction<&'trans Connection>,
     ) -> LazyRows<'trans, 'stmt> {
         LazyRows {
             stmt: stmt,
@@ -313,18 +310,13 @@ impl<'trans, 'stmt> LazyRows<'trans, 'stmt> {
     fn execute(&mut self) -> Result<()> {
         let mut conn = self.stmt.conn().0.borrow_mut();
 
-        conn.stream.write_message(|buf| {
-            frontend::execute(&self.name, self.row_limit, buf)
-        })?;
-        conn.stream.write_message(
-            |buf| Ok::<(), io::Error>(frontend::sync(buf)),
-        )?;
+        conn.stream
+            .write_message(|buf| frontend::execute(&self.name, self.row_limit, buf))?;
+        conn.stream
+            .write_message(|buf| Ok::<(), io::Error>(frontend::sync(buf)))?;
         conn.stream.flush()?;
-        conn.read_rows(|row| self.data.push_back(row)).map(
-            |more_rows| {
-                self.more_rows = more_rows
-            },
-        )
+        conn.read_rows(|row| self.data.push_back(row))
+            .map(|more_rows| self.more_rows = more_rows)
     }
 
     /// Returns a slice describing the columns of the `LazyRows`.
@@ -350,11 +342,9 @@ impl<'trans, 'stmt> FallibleIterator for LazyRows<'trans, 'stmt> {
             self.execute()?;
         }
 
-        let row = self.data.pop_front().map(|r| {
-            Row {
-                stmt_info: &**self.stmt.info(),
-                data: MaybeOwned::Owned(r),
-            }
+        let row = self.data.pop_front().map(|r| Row {
+            stmt_info: &**self.stmt.info(),
+            data: MaybeOwned::Owned(r),
         });
 
         Ok(row)

@@ -5,25 +5,25 @@ use std::f64;
 use std::fmt;
 use std::result;
 
+use postgres::types::{FromSql, IsNull, Kind, ToSql, Type, WrongType, INT4, NUMERIC, TEXT};
 use postgres::{Connection, TlsMode};
-use postgres::types::{ToSql, FromSql, WrongType, Type, IsNull, Kind, TEXT, INT4, NUMERIC};
 
 #[cfg(feature = "with-bit-vec")]
 mod bit_vec;
+#[cfg(feature = "with-chrono")]
+mod chrono;
 #[cfg(feature = "with-eui48")]
 mod eui48;
-#[cfg(feature = "with-uuid")]
-mod uuid;
-#[cfg(feature = "with-time")]
-mod time;
+#[cfg(feature = "with-geo")]
+mod geo;
 #[cfg(feature = "with-rustc-serialize")]
 mod rustc_serialize;
 #[cfg(feature = "with-serde_json")]
 mod serde_json;
-#[cfg(feature = "with-chrono")]
-mod chrono;
-#[cfg(feature = "with-geo")]
-mod geo;
+#[cfg(feature = "with-time")]
+mod time;
+#[cfg(feature = "with-uuid")]
+mod uuid;
 
 fn test_type<T: PartialEq + FromSql + ToSql, S: fmt::Display>(sql_type: &str, checks: &[(T, S)]) {
     let conn = or_panic!(Connection::connect(
@@ -48,7 +48,7 @@ fn test_ref_tosql() {
         TlsMode::None,
     ));
     let stmt = conn.prepare("SELECT $1::Int").unwrap();
-    let num: &ToSql = &&7;
+    let num: &dyn ToSql = &&7;
     stmt.query(&[num]).unwrap();
 }
 
@@ -225,15 +225,9 @@ fn test_citext_params() {
     ));
     or_panic!(conn.execute(
         "INSERT INTO foo (b) VALUES ($1), ($2), ($3)",
-        &[
-            &Some("foobar"),
-            &Some("FooBar"),
-            &None::<&'static str>,
-        ],
+        &[&Some("foobar"), &Some("FooBar"), &None::<&'static str>,],
     ));
-    let stmt = or_panic!(conn.prepare(
-        "SELECT id FROM foo WHERE b = 'FOOBAR' ORDER BY id",
-    ));
+    let stmt = or_panic!(conn.prepare("SELECT id FROM foo WHERE b = 'FOOBAR' ORDER BY id",));
     let res = or_panic!(stmt.query(&[]));
 
     assert_eq!(
@@ -334,9 +328,11 @@ fn test_slice() {
     conn.batch_execute(
         "CREATE TEMPORARY TABLE foo (id SERIAL PRIMARY KEY, f VARCHAR);
                         INSERT INTO foo (f) VALUES ('a'), ('b'), ('c'), ('d');",
-    ).unwrap();
+    )
+    .unwrap();
 
-    let stmt = conn.prepare("SELECT f FROM foo WHERE id = ANY($1)")
+    let stmt = conn
+        .prepare("SELECT f FROM foo WHERE id = ANY($1)")
         .unwrap();
     let result = stmt.query(&[&&[1i32, 3, 4][..]]).unwrap();
     assert_eq!(
@@ -354,7 +350,8 @@ fn test_slice_wrong_type() {
     conn.batch_execute("CREATE TEMPORARY TABLE foo (id SERIAL PRIMARY KEY)")
         .unwrap();
 
-    let stmt = conn.prepare("SELECT * FROM foo WHERE id = ANY($1)")
+    let stmt = conn
+        .prepare("SELECT * FROM foo WHERE id = ANY($1)")
         .unwrap();
     let err = stmt.query(&[&&["hi"][..]]).unwrap_err();
     match err.as_conversion() {
@@ -385,7 +382,7 @@ fn domain() {
             &self,
             ty: &Type,
             out: &mut Vec<u8>,
-        ) -> result::Result<IsNull, Box<error::Error + Sync + Send>> {
+        ) -> result::Result<IsNull, Box<dyn error::Error + Sync + Send>> {
             let inner = match *ty.kind() {
                 Kind::Domain(ref inner) => inner,
                 _ => unreachable!(),
@@ -394,8 +391,8 @@ fn domain() {
         }
 
         fn accepts(ty: &Type) -> bool {
-            ty.name() == "session_id" &&
-                match *ty.kind() {
+            ty.name() == "session_id"
+                && match *ty.kind() {
                     Kind::Domain(_) => true,
                     _ => false,
                 }
@@ -408,7 +405,7 @@ fn domain() {
         fn from_sql(
             ty: &Type,
             raw: &[u8],
-        ) -> result::Result<Self, Box<error::Error + Sync + Send>> {
+        ) -> result::Result<Self, Box<dyn error::Error + Sync + Send>> {
             Vec::<u8>::from_sql(ty, raw).map(SessionId)
         }
 
@@ -422,7 +419,8 @@ fn domain() {
     conn.batch_execute(
         "CREATE DOMAIN pg_temp.session_id AS bytea CHECK(octet_length(VALUE) = 16);
                         CREATE TABLE pg_temp.foo (id pg_temp.session_id);",
-    ).unwrap();
+    )
+    .unwrap();
 
     let id = SessionId(b"0123456789abcdef".to_vec());
     conn.execute("INSERT INTO pg_temp.foo (id) VALUES ($1)", &[&id])
@@ -440,7 +438,8 @@ fn composite() {
                             supplier INTEGER,
                             price NUMERIC
                         )",
-    ).unwrap();
+    )
+    .unwrap();
 
     let stmt = conn.prepare("SELECT $1::inventory_item").unwrap();
     let type_ = &stmt.param_types()[0];
